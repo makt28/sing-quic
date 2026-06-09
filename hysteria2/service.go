@@ -61,7 +61,9 @@ type Service[U comparable] struct {
 	salamanderPassword    string
 	tlsConfig             aTLS.ServerConfig
 	quicConfig            *quic.Config
-	userMap               map[string]U
+	usersMu               sync.RWMutex
+	userMap               map[string]U // password -> user
+	userPwMap             map[U]string // user -> password (reverse index for incremental updates)
 	udpDisabled           bool
 	udpTimeout            time.Duration
 	handler               ServerHandler
@@ -99,6 +101,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		tlsConfig:             options.TLSConfig,
 		quicConfig:            quicConfig,
 		userMap:               make(map[string]U),
+		userPwMap:             make(map[U]string),
 		udpDisabled:           options.UDPDisabled,
 		udpTimeout:            options.UDPTimeout,
 		handler:               options.Handler,
@@ -106,12 +109,74 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 	}, nil
 }
 
+// UpdateUsers atomically replaces the entire user set. Equivalent to
+// removing every current user and re-adding the given list. Kept for
+// callers that rebuild a full user list each refresh cycle; new callers
+// may prefer AddUsers/RemoveUsers for incremental updates.
+//
+// Unlike upstream, the swap is performed under usersMu so it is safe to
+// call at runtime concurrently with the authentication read path
+// (ServeHTTP). Upstream sing-box only calls this once at construction;
+// SingR refreshes users live, which would otherwise race on userMap.
 func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
-	userMap := make(map[string]U)
+	userMap := make(map[string]U, len(userList))
+	userPwMap := make(map[U]string, len(userList))
 	for i, user := range userList {
 		userMap[passwordList[i]] = user
+		userPwMap[user] = passwordList[i]
 	}
+	s.usersMu.Lock()
 	s.userMap = userMap
+	s.userPwMap = userPwMap
+	s.usersMu.Unlock()
+}
+
+// AddUsers adds or updates users incrementally. If a user already exists
+// its password is rotated (old password entry removed first); if a
+// password was previously bound to a different user that stale reverse
+// entry is dropped. Safe to call concurrently with authentication.
+func (s *Service[U]) AddUsers(userList []U, passwordList []string) {
+	if len(userList) == 0 {
+		return
+	}
+	s.usersMu.Lock()
+	defer s.usersMu.Unlock()
+	for i, user := range userList {
+		password := passwordList[i]
+		if oldPassword, ok := s.userPwMap[user]; ok && oldPassword != password {
+			delete(s.userMap, oldPassword)
+		}
+		if oldUser, ok := s.userMap[password]; ok && oldUser != user {
+			delete(s.userPwMap, oldUser)
+		}
+		s.userMap[password] = user
+		s.userPwMap[user] = password
+	}
+}
+
+// RemoveUsers removes users by their identity (U). Unknown users are
+// silently ignored. Safe to call concurrently with authentication.
+func (s *Service[U]) RemoveUsers(userList []U) {
+	if len(userList) == 0 {
+		return
+	}
+	s.usersMu.Lock()
+	defer s.usersMu.Unlock()
+	for _, user := range userList {
+		if password, ok := s.userPwMap[user]; ok {
+			delete(s.userMap, password)
+			delete(s.userPwMap, user)
+		}
+	}
+}
+
+// authenticate looks up a user by the client-supplied auth password under
+// a read lock.
+func (s *Service[U]) authenticate(password string) (U, bool) {
+	s.usersMu.RLock()
+	user, loaded := s.userMap[password]
+	s.usersMu.RUnlock()
+	return user, loaded
 }
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
@@ -193,7 +258,7 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		request := protocol.AuthRequestFromHeader(r.Header)
-		user, loaded := s.userMap[request.Auth]
+		user, loaded := s.authenticate(request.Auth)
 		if !loaded {
 			s.masqueradeHandler.ServeHTTP(w, r)
 			return
