@@ -68,7 +68,7 @@ type Service[U comparable] struct {
 	geckoMaxPacketSize    int
 	tlsConfig             aTLS.ServerConfig
 	quicConfig            *quic.Config
-	userMap               map[string]U
+	users                 *userTable[U] // fork: see service_users.go
 	udpDisabled           bool
 	udpTimeout            time.Duration
 	handler               ServerHandler
@@ -138,7 +138,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		geckoMaxPacketSize:    options.GeckoMaxPacketSize,
 		tlsConfig:             options.TLSConfig,
 		quicConfig:            quicConfig,
-		userMap:               make(map[string]U),
+		users:                 newUserTable[U](),
 		udpDisabled:           options.UDPDisabled,
 		udpTimeout:            options.UDPTimeout,
 		handler:               options.Handler,
@@ -146,14 +146,6 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		bbrProfile:            bbrProfile,
 		realmServer:           realmServer,
 	}, nil
-}
-
-func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
-	userMap := make(map[string]U)
-	for i, user := range userList {
-		userMap[passwordList[i]] = user
-	}
-	s.userMap = userMap
 }
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
@@ -280,7 +272,7 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		request := protocol.AuthRequestFromHeader(r.Header)
-		user, loaded := s.userMap[request.Auth]
+		user, loaded := s.users.lookup(request.Auth)
 		if !loaded {
 			s.masqueradeHandler.ServeHTTP(w, r)
 			return
